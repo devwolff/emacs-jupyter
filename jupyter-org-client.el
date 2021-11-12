@@ -695,7 +695,10 @@ If PARAMS has non-nil value for key ':pandoc' and TYPE is in
 Otherwise, wrap it in an export block."
   (if (and (alist-get :pandoc params)
            (member type jupyter-org-pandoc-convertable))
-      (jupyter-org-raw-string (jupyter-pandoc-convert type "org" value))
+      (list 'pandoc
+            (list :text "Converting..."
+                  :type type
+                  :value value))
     (jupyter-org-export-block type value)))
 
 (defun jupyter-org-export-block (type value)
@@ -1470,6 +1473,38 @@ Assumes `point' is on the #+RESULTS keyword line."
               (set-marker end nil)))
           (jupyter-org--mark-stream-result-newline result))))))
 
+(defun jupyter-org-pandoc-placeholder-element (el)
+  "Launch a Pandoc conversion process of EL, return a placeholder string.
+The placeholder string is meant to be inserted into the Org
+buffer and replaced with the result of conversion when ready.
+
+EL is an an Org element with the properties
+
+    :text  The placeholder text to use.
+    :type  The type of syntax from which to convert.
+    :value The code with the corresponding syntax."
+  (letrec ((buf (current-buffer))
+           (cb (lambda ()
+                 (let ((to-string (buffer-string)))
+                   (with-current-buffer buf
+                     (save-excursion
+                       ;; TODO: Reduce the search to near the source
+                       ;; block for this result.
+                       (goto-char (point-min))
+                       (when (text-property-search-forward 'jupyter-pandoc proc)
+                         (delete-region (point)
+                                        (1+ (next-single-property-change
+                                             (point) 'jupyter-pandoc)))
+                         (insert to-string)))))))
+           (proc (jupyter-pandoc-convert
+                  (org-element-property :type el) "org"
+                  (org-element-property :value el)
+                  cb)))
+    (jupyter-org-raw-string
+     (propertize
+      (org-element-property :text el)
+      'jupyter-pandoc proc))))
+
 (cl-defgeneric jupyter-org--insert-result (req context result)
   "For REQ and given CONTEXT, insert RESULT.
 REQ is a `jupyter-org-request' that contains the context of the
@@ -1481,6 +1516,10 @@ source block associated with REQ.
 RESULT is the new result, as an org element, to be inserted.")
 
 (cl-defmethod jupyter-org--insert-result (_req context result)
+  (when (eq (org-element-type result) 'pandoc)
+    (setq result
+          (jupyter-org-pandoc-placeholder-element result)))
+
   (insert (org-element-interpret-data
            (jupyter-org--wrap-result-maybe
             context (if (jupyter-org--stream-result-p result)
@@ -1514,7 +1553,10 @@ RESULT is the new result, as an org element, to be inserted.")
   (cond
    ((jupyter-org-request-silent-p req)
     (unless (equal (jupyter-org-request-silent-p req) "none")
-      (message "%s" (org-element-interpret-data result))))
+      (if (eq (org-element-type result) 'pandoc)
+          (message "[%s] %s" (org-element-property :type result)
+                   (org-element-property :value result))
+        (message "%s" (org-element-interpret-data result)))))
    ((jupyter-org-request-async-p req)
     (jupyter-org--clear-request-id req)
     (jupyter-org--do-insert-result req result))
@@ -1579,7 +1621,14 @@ example-block elements."
 Meant to be used as the return value of
 `org-babel-execute:jupyter'."
   (when-let* ((results (jupyter-org--coalesce-stream-results
-                        (nreverse (jupyter-org-request-results req))))
+                        (mapcar (lambda (el)
+                                  (if (eq (org-element-type el) 'pandoc)
+                                      (jupyter-org-raw-string
+                                       (jupyter-pandoc-convert
+                                        (org-element-property :type el) "org"
+                                        (org-element-property :value el)))
+                                    el))
+                                (nreverse (jupyter-org-request-results req)))))
               (params (jupyter-org-request-block-params req))
               (result-params (alist-get :result-params params)))
     (org-element-interpret-data
